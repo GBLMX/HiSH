@@ -54,7 +54,7 @@ QQ群二维码
 * 下载以下文件到指定位置：
   - [libs.zip](https://github.com/harmoninux/qemu/releases/download/hish-20260110/libs.zip)（解压到`feature/hish_main/libs`）
   - [feature/hish_main/src/main/resources/rawfile/vm/kernel_aarch64](https://github.com/harmoninux/linux-config/releases/download/kernel-20260321/kernel_aarch64)
-  - [feature/hish_main/src/main/resources/rawfile/vm/rootfs_aarch64.qcow2](https://github.com/harmoninux/linux-config/releases/download/rootfs-20260117/rootfs_aarch64.qcow2)
+  - [feature/hish_main/src/main/resources/rawfile/vm/rootfs_aarch64.qcow2](https://github.com/GBLMX/linux-config/releases/download/rootfs-20261120/rootfs_aarch64.qcow2)
 * 在DevEco Studio中构建项目（默认构建`product/tablet`，如需同时构建Phone版，取消`build-profile.json5`中phone模块的注释）
 * 签名后在设备或模拟器上运行。参考 [本地真机运行应用](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/ide-run-device) | [自动签名-未关联注册应用](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/ide-signing#section151231211105010)
 

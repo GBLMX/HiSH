@@ -40,7 +40,7 @@ You can try one of following methods to get HiSH:
 - Download files and move to corresponding location as following (Notice: you should rename files as links)
   - [feature/hish_main/libs.zip](https://github.com/harmoninux/qemu/releases/download/hish-20260110/libs.zip)(Extract to `feature/hish_main/libs`)
   - [feature/hish_main/src/main/resources/rawfile/vm/kernel_aarch64](https://github.com/harmoninux/linux-config/releases/download/kernel-20260228/kernel_aarch64)
-  - [feature/hish_main/src/main/resources/rawfile/vm/rootfs_aarch64.qcow2](https://github.com/harmoninux/linux-config/releases/download/rootfs-20260117/rootfs_aarch64.qcow2)
+  - [feature/hish_main/src/main/resources/rawfile/vm/rootfs_aarch64.qcow2](https://github.com/GBLMX/linux-config/releases/download/rootfs-20261120/rootfs_aarch64.qcow2)
 - Build project in DevEco Studio
 - Sign and run in your device or emulator. See [Running Your App on a Local Real Device](https://developer.huawei.com/consumer/en/doc/harmonyos-guides/ide-run-device) | [Signing an App Not Associated with a Registered App](https://developer.huawei.com/consumer/en/doc/harmonyos-guides/ide-signing#section151231211105010)
 

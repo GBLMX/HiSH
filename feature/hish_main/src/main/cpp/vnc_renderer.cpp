@@ -14,6 +14,7 @@
 #include <native_window/external_window.h>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 #include "hilog/log.h"
 
 #undef LOG_DOMAIN
@@ -86,10 +87,11 @@ int VncRenderer::surfaceWidth_ = 0;
 int VncRenderer::surfaceHeight_ = 0;
 
 std::atomic<bool> VncRenderer::dirty_(false);
-int VncRenderer::dirtyX_ = 0;
-int VncRenderer::dirtyY_ = 0;
-int VncRenderer::dirtyW_ = 0;
-int VncRenderer::dirtyH_ = 0;
+bool VncRenderer::fullDirty_ = false;
+int VncRenderer::tileCols_ = 0;
+int VncRenderer::tileRows_ = 0;
+std::vector<uint8_t> VncRenderer::dirtyTiles_;
+std::vector<uint8_t> VncRenderer::pendingTiles_;
 std::mutex VncRenderer::dirtyMutex_;
 
 std::thread VncRenderer::renderThread_;
@@ -420,24 +422,39 @@ bool VncRenderer::initGL() {
 }
 
 void VncRenderer::markDirty(int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(dirtyMutex_);
-        if (!dirty_.load()) {
-            dirtyX_ = x;
-            dirtyY_ = y;
-            dirtyW_ = w;
-            dirtyH_ = h;
+        if (tileCols_ <= 0 || tileRows_ <= 0) {
+            fullDirty_ = true;
         } else {
-            int nx2 = x + w;
-            int ny2 = y + h;
-            int ox2 = dirtyX_ + dirtyW_;
-            int oy2 = dirtyY_ + dirtyH_;
-            dirtyX_ = std::min(dirtyX_, x);
-            dirtyY_ = std::min(dirtyY_, y);
-            dirtyW_ = std::max(ox2, nx2) - dirtyX_;
-            dirtyH_ = std::max(oy2, ny2) - dirtyY_;
+            int x0 = std::max(0, x);
+            int y0 = std::max(0, y);
+            int x1 = std::min(tileCols_ * kTileSize - 1, x + w - 1);
+            int y1 = std::min(tileRows_ * kTileSize - 1, y + h - 1);
+            if (x0 <= x1 && y0 <= y1) {
+                int tx0 = x0 / kTileSize;
+                int ty0 = y0 / kTileSize;
+                int tx1 = x1 / kTileSize;
+                int ty1 = y1 / kTileSize;
+                int tileCount = (tx1 - tx0 + 1) * (ty1 - ty0 + 1);
+                if (tileCount > kMaxTileUploads) {
+                    // 大面积更新走整帧上传，避免大量小 glTexSubImage2D 调用
+                    fullDirty_ = true;
+                } else {
+                    for (int ty = ty0; ty <= ty1; ++ty) {
+                        for (int tx = tx0; tx <= tx1; ++tx) {
+                            dirtyTiles_[static_cast<size_t>(ty) * tileCols_ + tx] = 1;
+                        }
+                    }
+                }
+            }
         }
     }
+
     dirty_.store(true, std::memory_order_release);
     renderWakeCv_.notify_one();
 }
@@ -473,14 +490,26 @@ void VncRenderer::renderLoop() {
 void VncRenderer::renderFrameInternal() {
     if (!dirty_.load(std::memory_order_acquire) && !surfaceResized_.load(std::memory_order_acquire)) return;
 
-    // Grab and clear dirty region
-    int x, y, w, h;
+    // Grab and clear dirty tiles
+    bool full = false;
     {
         std::lock_guard<std::mutex> lock(dirtyMutex_);
-        x = dirtyX_;
-        y = dirtyY_;
-        w = dirtyW_;
-        h = dirtyH_;
+        full = fullDirty_;
+        fullDirty_ = false;
+        if (full) {
+            std::fill(dirtyTiles_.begin(), dirtyTiles_.end(), 0);
+        } else {
+            pendingTiles_.swap(dirtyTiles_);
+            std::fill(dirtyTiles_.begin(), dirtyTiles_.end(), 0);
+            int marked = 0;
+            for (uint8_t tile : pendingTiles_) {
+                marked += tile ? 1 : 0;
+            }
+            if (marked > kMaxTileUploads) {
+                // 累计脏 tile 过多时整帧上传
+                full = true;
+            }
+        }
         dirty_.store(false, std::memory_order_release);
     }
 
@@ -507,8 +536,8 @@ void VncRenderer::renderFrameInternal() {
         return;
     }
 
-    // Upload dirty region to texture
-    updateTexture(x, y, w, h, needFullUpload);
+    // Upload dirty tiles to texture
+    updateTexture(needFullUpload || full);
 
     if (vncWidth_ <= 0 || vncHeight_ <= 0) return;
 
@@ -549,7 +578,22 @@ void VncRenderer::renderFrameInternal() {
     }
 }
 
-void VncRenderer::updateTexture(int x, int y, int w, int h, bool forceFull) {
+void VncRenderer::configureTiles(int width, int height) {
+    int cols = (width + kTileSize - 1) / kTileSize;
+    int rows = (height + kTileSize - 1) / kTileSize;
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+
+    std::lock_guard<std::mutex> lock(dirtyMutex_);
+    if (cols == tileCols_ && rows == tileRows_) return;
+    tileCols_ = cols;
+    tileRows_ = rows;
+    dirtyTiles_.assign(static_cast<size_t>(cols) * rows, 0);
+    pendingTiles_.assign(static_cast<size_t>(cols) * rows, 0);
+    // 调用方随后会做一次整帧上传
+}
+
+void VncRenderer::updateTexture(bool forceFull) {
     if (textureId_ == 0) return;
 
     int vw, vh;
@@ -562,26 +606,36 @@ void VncRenderer::updateTexture(int x, int y, int w, int h, bool forceFull) {
         vh = VncClient::getFrameHeight();
         if (vw <= 0 || vh <= 0) return;
 
+        // 初始化直传后 tile 网格可能尚未建立，这里补一次配置
+        if (tileCols_ <= 0 || vw != vncWidth_ || vh != vncHeight_) {
+            configureTiles(vw, vh);
+        }
+        bool sizeChanged = (vw != vncWidth_ || vh != vncHeight_);
+
         glBindTexture(GL_TEXTURE_2D, textureId_);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
 
-        if (forceFull || vw != vncWidth_ || vh != vncHeight_) {
+        if (forceFull || sizeChanged || vao_ == 0) {
             vncWidth_ = vw;
             vncHeight_ = vh;
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, vncWidth_, vncHeight_, 0,
                          GL_RGB, GL_UNSIGNED_SHORT_5_6_5, fb);
-        } else if (vao_ != 0) {
+        } else if (!pendingTiles_.empty()) {
             glPixelStorei(GL_UNPACK_ROW_LENGTH, vncWidth_);
-            glPixelStorei(GL_UNPACK_SKIP_PIXELS, x);
-            glPixelStorei(GL_UNPACK_SKIP_ROWS, y);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
-                            GL_RGB, GL_UNSIGNED_SHORT_5_6_5, fb);
+            for (int ty = 0; ty < tileRows_; ++ty) {
+                for (int tx = 0; tx < tileCols_; ++tx) {
+                    if (!pendingTiles_[static_cast<size_t>(ty) * tileCols_ + tx]) continue;
+                    int x = tx * kTileSize;
+                    int y = ty * kTileSize;
+                    int w = std::min(kTileSize, vncWidth_ - x);
+                    int h = std::min(kTileSize, vncHeight_ - y);
+                    if (w <= 0 || h <= 0) continue;
+                    const uint8_t* src = fb + (static_cast<size_t>(y) * vncWidth_ + x) * 2;
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
+                                    GL_RGB, GL_UNSIGNED_SHORT_5_6_5, src);
+                }
+            }
             glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-            glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-            glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-        } else {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vncWidth_, vncHeight_,
-                            GL_RGB, GL_UNSIGNED_SHORT_5_6_5, fb);
         }
 
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -605,6 +659,15 @@ void VncRenderer::cleanupGL() {
     vncHeight_ = 0;
     surfaceWidth_ = 0;
     surfaceHeight_ = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(dirtyMutex_);
+        tileCols_ = 0;
+        tileRows_ = 0;
+        dirtyTiles_.clear();
+        pendingTiles_.clear();
+        fullDirty_ = false;
+    }
 
     if (eglDisplay_ != EGL_NO_DISPLAY) {
         eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

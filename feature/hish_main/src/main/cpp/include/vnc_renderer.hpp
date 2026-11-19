@@ -15,6 +15,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <vector>
 #include <condition_variable>
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
@@ -41,6 +42,9 @@ public:
     VncRenderer() = delete;
 
 private:
+    static constexpr int kTileSize = 64;
+    static constexpr int kMaxTileUploads = 32;
+
     // EGL resources (only touched on render thread after init)
     static EGLDisplay eglDisplay_;
     static EGLSurface eglSurface_;
@@ -69,7 +73,11 @@ private:
 
     // Dirty region tracking (written by any thread via markDirty, read by render thread)
     static std::atomic<bool> dirty_;
-    static int dirtyX_, dirtyY_, dirtyW_, dirtyH_;
+    static bool fullDirty_;
+    static int tileCols_;
+    static int tileRows_;
+    static std::vector<uint8_t> dirtyTiles_;
+    static std::vector<uint8_t> pendingTiles_;
     static std::mutex dirtyMutex_;
 
     // Render thread state
@@ -87,7 +95,8 @@ private:
     static bool initGL();
     static bool createShaders();
     static void cleanupGL();
-    static void updateTexture(int x, int y, int w, int h, bool forceFull = false);
+    static void updateTexture(bool forceFull);
+    static void configureTiles(int width, int height);
     static void renderLoop();           // Render thread entry point
     static void renderFrameInternal();  // Single frame render (called on render thread)
 };

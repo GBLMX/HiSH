@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <atomic>
+#include <chrono>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -47,6 +49,16 @@ napi_threadsafe_function on_shutdown_callback = nullptr;
 
 std::mutex buffer_mtx;
 std::string temp_buffer = "";
+
+#ifndef NDEBUG
+static std::atomic<int> debug_client_fd{-1};
+static std::atomic<bool> debug_bridge_running{false};
+static std::thread debug_bridge_thread;
+#endif
+
+static uint64_t serial_bytes_total = 0;
+static uint64_t serial_batches_total = 0;
+static size_t serial_batch_max = 0;
 
 typedef int (*QemuSystemEntry)(int, const char **);
 
@@ -864,13 +876,143 @@ void on_serial_data_received(const uint8_t *data, size_t size) {
     if (size == 0) {
         return;
     }
-    std::lock_guard<std::mutex> lk(buffer_mtx);
-    if (on_data_callback != nullptr) {
-        send_data_to_callback(data, size, on_data_callback);
-    } else {
-        temp_buffer.append(reinterpret_cast<const char *>(data), size);
+
+    serial_bytes_total += size;
+    serial_batches_total += 1;
+    if (size > serial_batch_max) {
+        serial_batch_max = size;
     }
+
+    {
+        std::lock_guard<std::mutex> lk(buffer_mtx);
+        if (on_data_callback != nullptr) {
+            send_data_to_callback(data, size, on_data_callback);
+        } else {
+            temp_buffer.append(reinterpret_cast<const char *>(data), size);
+        }
+    }
+
+#ifndef NDEBUG
+    int client = debug_client_fd.load(std::memory_order_acquire);
+    if (client >= 0) {
+        ssize_t sent = send(client, data, size, MSG_DONTWAIT | MSG_NOSIGNAL);
+        (void)sent;
+    }
+#endif
 }
+
+#ifndef NDEBUG
+static void debug_bridge_loop(int listen_fd) {
+    while (debug_bridge_running.load(std::memory_order_acquire)) {
+        int client = accept(listen_fd, nullptr, nullptr);
+        if (client < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        int old = debug_client_fd.exchange(client, std::memory_order_acq_rel);
+        if (old >= 0) {
+            close(old);
+        }
+        OH_LOG_INFO(LOG_APP, "debug bridge client connected");
+
+        char buf[4096];
+        while (debug_bridge_running.load(std::memory_order_acquire)) {
+            ssize_t n = read(client, buf, sizeof(buf));
+            if (n > 0) {
+                int out = serial_input_fd;
+                if (out < 0) {
+                    continue;
+                }
+                size_t off = 0;
+                while (off < static_cast<size_t>(n)) {
+                    ssize_t w = send(out, buf + off, static_cast<size_t>(n) - off, MSG_NOSIGNAL);
+                    if (w > 0) {
+                        off += static_cast<size_t>(w);
+                        continue;
+                    }
+                    if (w < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+            } else if (n == 0) {
+                break;
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        int current = debug_client_fd.exchange(-1, std::memory_order_acq_rel);
+        if (current >= 0) {
+            close(current);
+        }
+        OH_LOG_INFO(LOG_APP, "debug bridge client disconnected");
+    }
+    close(listen_fd);
+}
+
+static napi_value startDebugBridge(napi_env env, napi_callback_info info) {
+    bool ok = false;
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    int32_t port = 7300;
+    if (argc >= 1) {
+        napi_get_value_int32(env, args[0], &port);
+    }
+    if (port <= 0 || port > 65535) {
+        port = 7300;
+    }
+
+    bool expected = false;
+    if (debug_bridge_running.compare_exchange_strong(expected, true)) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            OH_LOG_ERROR(LOG_APP, "debug bridge socket failed: %{public}d", errno);
+            debug_bridge_running.store(false);
+        } else {
+            int opt = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = htons(static_cast<uint16_t>(port));
+            if (bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0 &&
+                listen(fd, 4) == 0) {
+                debug_bridge_thread = std::thread(debug_bridge_loop, fd);
+                debug_bridge_thread.detach();
+                OH_LOG_INFO(LOG_APP, "debug bridge listening on 127.0.0.1:%{public}d", port);
+                ok = true;
+            } else {
+                OH_LOG_ERROR(LOG_APP, "debug bridge listen failed: %{public}d", errno);
+                close(fd);
+                debug_bridge_running.store(false);
+            }
+        }
+    } else {
+        ok = true;
+    }
+
+    napi_value ret;
+    napi_get_boolean(env, ok, &ret);
+    return ret;
+}
+#else
+static napi_value startDebugBridge(napi_env env, napi_callback_info info) {
+    (void)env;
+    (void)info;
+    napi_value ret;
+    napi_get_boolean(env, false, &ret);
+    return ret;
+}
+#endif
 
 void serial_output_worker(const char *unix_socket_path) {
 
@@ -921,6 +1063,11 @@ void serial_output_worker(const char *unix_socket_path) {
     constexpr size_t kSerialBatchLimit = 256 * 1024;
     uint8_t read_buffer[kSerialReadChunk];
 
+#ifndef NDEBUG
+    auto lastMetricsAt = std::chrono::steady_clock::now();
+    uint64_t lastMetricsBytes = 0;
+    uint64_t lastMetricsBatches = 0;
+#endif
     while (true) {
 
         bool broken = false;
@@ -969,6 +1116,28 @@ void serial_output_worker(const char *unix_socket_path) {
             }
         }
 
+#ifndef NDEBUG
+        auto metricsNow = std::chrono::steady_clock::now();
+        auto metricsElapsedMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(metricsNow - lastMetricsAt).count();
+        if (metricsElapsedMs >= 5000) {
+            uint64_t bytes = serial_bytes_total;
+            uint64_t batches = serial_batches_total;
+            uint64_t kbps = metricsElapsedMs > 0
+                ? ((bytes - lastMetricsBytes) * 1000 / 1024) / static_cast<uint64_t>(metricsElapsedMs)
+                : 0;
+            uint64_t bps = metricsElapsedMs > 0
+                ? ((batches - lastMetricsBatches) * 1000) / static_cast<uint64_t>(metricsElapsedMs)
+                : 0;
+            OH_LOG_INFO(LOG_APP, "serial metrics: %{public}llu KB/s, %{public}llu batches/s, max_batch=%{public}zu",
+                        static_cast<unsigned long long>(kbps),
+                        static_cast<unsigned long long>(bps),
+                        serial_batch_max);
+            lastMetricsAt = metricsNow;
+            lastMetricsBytes = bytes;
+            lastMetricsBatches = batches;
+        }
+#endif
         if (broken) {
             break;
         }
@@ -1243,6 +1412,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"onShutdown", nullptr, onShutdown, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendInput", nullptr, sendInput, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"checkPortUsed", nullptr, checkPortUsed, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"startDebugBridge", nullptr, startDebugBridge, nullptr, nullptr, nullptr, napi_default, nullptr},
         // 快照管理功能
         {"getImageInfo", nullptr, getImageInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getSnapshots", nullptr, getSnapshots, nullptr, nullptr, nullptr, napi_default, nullptr},

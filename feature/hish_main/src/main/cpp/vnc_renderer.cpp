@@ -15,6 +15,7 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include "hilog/log.h"
 
 #undef LOG_DOMAIN
@@ -93,6 +94,12 @@ int VncRenderer::tileRows_ = 0;
 std::vector<uint8_t> VncRenderer::dirtyTiles_;
 std::vector<uint8_t> VncRenderer::pendingTiles_;
 std::mutex VncRenderer::dirtyMutex_;
+
+static uint64_t vncFrames = 0;
+static uint64_t vncTileUploads = 0;
+static uint64_t vncFullUploads = 0;
+static uint64_t vncUploadMicros = 0;
+static std::chrono::steady_clock::time_point vncMetricsAt = std::chrono::steady_clock::now();
 
 std::thread VncRenderer::renderThread_;
 std::atomic<bool> VncRenderer::renderRunning_(false);
@@ -576,6 +583,18 @@ void VncRenderer::renderFrameInternal() {
     if (!eglSwapBuffers(eglDisplay_, eglSurface_)) {
         OH_LOG_ERROR(LOG_APP, "eglSwapBuffers failed: 0x%{public}x", eglGetError());
     }
+
+    vncFrames += 1;
+    auto metricsNow = std::chrono::steady_clock::now();
+    if (metricsNow - vncMetricsAt >= std::chrono::seconds(5)) {
+        OH_LOG_INFO(LOG_APP,
+                    "VNC metrics: frames=%{public}llu tiles=%{public}llu full=%{public}llu upload_ms=%{public}llu",
+                    static_cast<unsigned long long>(vncFrames),
+                    static_cast<unsigned long long>(vncTileUploads),
+                    static_cast<unsigned long long>(vncFullUploads),
+                    static_cast<unsigned long long>(vncUploadMicros / 1000));
+        vncMetricsAt = metricsNow;
+    }
 }
 
 void VncRenderer::configureTiles(int width, int height) {
@@ -595,6 +614,8 @@ void VncRenderer::configureTiles(int width, int height) {
 
 void VncRenderer::updateTexture(bool forceFull) {
     if (textureId_ == 0) return;
+
+    auto uploadStart = std::chrono::steady_clock::now();
 
     int vw, vh;
     uint8_t* fb;
@@ -618,6 +639,7 @@ void VncRenderer::updateTexture(bool forceFull) {
         if (forceFull || sizeChanged || vao_ == 0) {
             vncWidth_ = vw;
             vncHeight_ = vh;
+            vncFullUploads += 1;
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, vncWidth_, vncHeight_, 0,
                          GL_RGB, GL_UNSIGNED_SHORT_5_6_5, fb);
         } else if (!pendingTiles_.empty()) {
@@ -633,12 +655,16 @@ void VncRenderer::updateTexture(bool forceFull) {
                     const uint8_t* src = fb + (static_cast<size_t>(y) * vncWidth_ + x) * 2;
                     glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
                                     GL_RGB, GL_UNSIGNED_SHORT_5_6_5, src);
+                    vncTileUploads += 1;
                 }
             }
             glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         }
 
         glBindTexture(GL_TEXTURE_2D, 0);
+        vncUploadMicros += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - uploadStart).count());
     }
 }
 

@@ -55,6 +55,14 @@ export default struct WebTerminal {
   private outputPortReady: boolean = false
   private portReadyPending: boolean = false
   private lastJsWrite?: Promise<string> = undefined
+  private debugBridgeStarted: boolean = false
+  private metricsTimer?: number = undefined
+  private portSends: number = 0
+  private fallbackSends: number = 0
+  private sendErrors: number = 0
+  private lastPortSends: number = 0
+  private lastFallbackSends: number = 0
+  private lastSendErrors: number = 0
   immersiveButton: ImmersiveButtonModifier = new ImmersiveButtonModifier()
   immersiveToggle: ImmersiveToggleModifier = new ImmersiveToggleModifier()
 
@@ -410,6 +418,7 @@ export default struct WebTerminal {
 
   async load(): Promise<void> {
     this.setupOutputPort();
+    this.startDebugBridge();
     this.webviewController.runJavaScript('exports.setFocused(true)')
     napi.onData((d: ArrayBuffer): void => this.onData(d))
     napi.onShutdown((): void => {
@@ -469,14 +478,17 @@ export default struct WebTerminal {
   private sendToWebView(data: Uint8Array): void {
     if (this.outputPortReady && this.outputPort !== undefined) {
       try {
+        this.portSends += 1;
         this.outputPort.postMessageEvent(data.buffer as ArrayBuffer);
         return;
       } catch (e) {
         hilog.error(DOMAIN, 'WebTerminal', 'postMessageEvent failed, fallback to runJavaScript: %{public}s',
           JSON.stringify(e));
+        this.sendErrors += 1;
         this.outputPortReady = false;
       }
     }
+    this.fallbackSends += 1;
     const base64 = new util.Base64Helper().encodeToStringSync(data);
     const jsWrite = this.webviewController.runJavaScript(`exports.writeBase64("${base64}")`);
     this.lastJsWrite = jsWrite;
@@ -491,6 +503,7 @@ export default struct WebTerminal {
       }
       this.maybeEnableOutputPort();
       hilog.error(DOMAIN, 'WebTerminal', 'writeBase64 failed: %{public}s', JSON.stringify(e));
+      this.sendErrors += 1;
     });
   }
 
@@ -499,6 +512,46 @@ export default struct WebTerminal {
       this.portReadyPending = false;
       this.outputPortReady = true;
     }
+  }
+
+  aboutToDisappear(): void {
+    if (this.metricsTimer !== undefined) {
+      clearInterval(this.metricsTimer);
+      this.metricsTimer = undefined;
+    }
+  }
+
+  private startDebugBridge(): void {
+    if (this.debugBridgeStarted) {
+      return;
+    }
+    this.debugBridgeStarted = true;
+    try {
+      if (napi.startDebugBridge(7300)) {
+        this.startMetricsTimer();
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, 'WebTerminal', 'debug bridge start failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private startMetricsTimer(): void {
+    if (this.metricsTimer !== undefined) {
+      return;
+    }
+    this.metricsTimer = setInterval(() => {
+      if (this.portSends === this.lastPortSends &&
+        this.fallbackSends === this.lastFallbackSends &&
+        this.sendErrors === this.lastSendErrors) {
+        return;
+      }
+      this.lastPortSends = this.portSends;
+      this.lastFallbackSends = this.fallbackSends;
+      this.lastSendErrors = this.sendErrors;
+      hilog.info(DOMAIN, 'WebTerminal',
+        'terminal metrics: port=%{public}d fallback=%{public}d errors=%{public}d',
+        this.portSends, this.fallbackSends, this.sendErrors);
+    }, 5000);
   }
 
   async resize(width: number, height: number): Promise<void> {

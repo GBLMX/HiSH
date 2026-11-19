@@ -528,35 +528,6 @@ export class QemuAgent {
     return result !== null
   }
 
-  /**
-   * 获取内存信息（通过 /proc/meminfo）
-   */
-  async getMemoryInfo(): Promise<Record<string, number> | null> {
-    // 使用 sh -c cat 以提高兼容性
-    const output = await this.execAndGetOutput('/bin/sh', ['-c', 'cat /proc/meminfo'])
-    if (!output) return null
-    return this.parseMemoryInfo(output)
-  }
-
-  /**
-   * 获取 CPU 统计信息（用于计算使用率）
-   */
-  async getCpuStats(): Promise<CpuStats | null> {
-    // 使用 sh -c cat 以提高兼容性
-    const output = await this.execAndGetOutput('/bin/sh', ['-c', 'cat /proc/stat'])
-    if (!output) return null
-    return this.parseCpuStats(output)
-  }
-
-  /**
-   * 检查 SSH 是否运行
-   */
-  async isSshRunning(): Promise<boolean> {
-    // 使用 sh -c 来执行 pgrep，利用 shell 的 PATH 查找命令，兼容性更好
-    // 同时尝试 pgrep 和 pidof
-    const output = await this.execAndGetOutput('/bin/sh', ['-c', 'pgrep sshd || pidof sshd'])
-    return output !== null && output.trim().length > 0
-  }
 
   private parseMemoryInfo(output: string): Record<string, number> {
     const result: Record<string, number> = {}

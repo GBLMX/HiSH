@@ -20,20 +20,6 @@ interface StartResult {
   vmStarted: boolean
 }
 
-/**
- * 获取一个未被占用的随机端口 (用于 VNC WebSocket)
- * @param min 最小端口号 (包含)
- * @param max 最大端口号 (包含)
- * @returns 可用端口号，如果找不到则返回 undefined
- */
-function getFreeVncPort(min: number, max: number): number | undefined {
-  const port = napi.findFreePort(min, max);
-  if (port < 0) {
-    hilog.warn(DOMAIN, 'testTag', 'Could not find a free VNC port in [%{public}d, %{public}d]', min, max);
-    return undefined;
-  }
-  return port;
-}
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {

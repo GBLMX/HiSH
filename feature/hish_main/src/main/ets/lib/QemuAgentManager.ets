@@ -248,7 +248,7 @@ class QemuAgentManagerImpl {
         return
       }
 
-      // [修复] 如果当前有使用者正在操作，不要发送心跳 ping，防止 pendingResponse 被清空导致业务指令超时
+      // 业务占用时跳过心跳，避免与状态查询/电源命令争用
       if (this.currentUser) {
         hilog.debug(DOMAIN, 'AgentManager', '业务正在占用 Agent，跳过此轮心跳')
         return

@@ -1404,6 +1404,63 @@ static napi_value checkPortUsed(napi_env env, napi_callback_info info) {
     }
 }
 
+// 在 [min_port, max_port] 内随机挑选一个可绑定端口，失败返回 -1。
+// 一次 NAPI 调用替代 JS 侧最多 100 次跨语言 checkPortUsed。
+static napi_value findFreePort(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    int32_t min_port = 5900;
+    int32_t max_port = 5999;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &min_port);
+    }
+    if (argc >= 2) {
+        napi_get_value_int32(env, argv[1], &max_port);
+    }
+    if (min_port < 1) {
+        min_port = 1;
+    }
+    if (max_port > 65535) {
+        max_port = 65535;
+    }
+    if (max_port < min_port) {
+        int32_t tmp = min_port;
+        min_port = max_port;
+        max_port = tmp;
+    }
+
+    int32_t found = -1;
+    const int32_t range = max_port - min_port + 1;
+    for (int i = 0; i < 100 && range > 0; i++) {
+        const int32_t port = min_port + (std::rand() % range);
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            break;
+        }
+        int v = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &v, sizeof(v));
+
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_ANY);
+        sa.sin_port = htons((uint16_t)port);
+
+        const bool free_port = bind(sock, (struct sockaddr *)&sa, sizeof(sa)) == 0;
+        close(sock);
+        if (free_port) {
+            found = port;
+            break;
+        }
+    }
+
+    napi_value result;
+    napi_create_int32(env, found, &result);
+    return result;
+}
+
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
@@ -1412,6 +1469,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"onShutdown", nullptr, onShutdown, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"sendInput", nullptr, sendInput, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"checkPortUsed", nullptr, checkPortUsed, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"findFreePort", nullptr, findFreePort, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startDebugBridge", nullptr, startDebugBridge, nullptr, nullptr, nullptr, napi_default, nullptr},
         // 快照管理功能
         {"getImageInfo", nullptr, getImageInfo, nullptr, nullptr, nullptr, napi_default, nullptr},

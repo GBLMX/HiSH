@@ -136,11 +136,16 @@ export struct VmStatusBar {
   private refreshTimer: number = -1
   private isComponentActive: boolean = true
   private lastCpuStats: CpuStats | null = null
+  private staticInfoAt: number = 0
+  private fsInfoAt: number = 0
+  @Watch('onAppBackgroundChanged') @StorageProp(appOption.appInBackground) appInBackground: boolean = false
 
   aboutToAppear() {
     this.isComponentActive = true
     this.settings.masterSwitch = true
-    this.initAgent()
+    if (!this.appInBackground) {
+      this.initAgent()
+    }
   }
 
   aboutToDisappear() {
@@ -267,6 +272,9 @@ export struct VmStatusBar {
 
   private startRefreshTimer() {
     this.stopRefreshTimer()
+    if (this.appInBackground) {
+      return
+    }
 
     // 设置刷新间隔：启用监控时使用用户设置，否则使用较长的默认间隔（30秒）保持状态同步
     const interval = this.settings.masterSwitch ? this.settings.refreshInterval : 30000
@@ -282,6 +290,17 @@ export struct VmStatusBar {
     if (this.refreshTimer !== -1) {
       clearInterval(this.refreshTimer)
       this.refreshTimer = -1
+    }
+  }
+
+  onAppBackgroundChanged(): void {
+    if (this.appInBackground) {
+      this.stopRefreshTimer()
+      return
+    }
+    if (this.isComponentActive) {
+      this.refreshStatus()
+      this.startRefreshTimer()
     }
   }
 
@@ -306,6 +325,8 @@ export struct VmStatusBar {
       // 3. 重置状态
       this.status.agentConnected = false
       this.lastCpuStats = null
+      this.staticInfoAt = 0
+      this.fsInfoAt = 0
 
       // 4. 尝试连接（使用 NORMAL 优先级，最多 3 次重试，间隔 2 秒）
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -384,15 +405,16 @@ export struct VmStatusBar {
         return
       }
 
-      // Ping 测试
-      const pingResult = await agent.ping()
-      this.status.agentConnected = pingResult
-      AppStorage.setOrCreate(appOption.isQgaConnected, pingResult)
-
-      if (!pingResult) {
+      // 一次快照同时验证连接并取回内存/CPU/SSH，替代独立 ping 与三次 exec
+      const metrics = await agent.getGuestMetrics()
+      if (!metrics) {
+        this.status.agentConnected = false
+        AppStorage.setOrCreate(appOption.isQgaConnected, false)
         await QemuAgentManager.release('VmStatusBar')
         return
       }
+      this.status.agentConnected = true
+      AppStorage.setOrCreate(appOption.isQgaConnected, true)
 
       // 如果当前状态是异常或重启中，连接成功后自动恢复为 RUNNING
       const currentStatus = this.currentEmulatorStatus
@@ -401,39 +423,43 @@ export struct VmStatusBar {
         hilog.info(DOMAIN, 'VmStatusBar', '状态已从 %{public}s 恢复为 RUNNING', currentStatus)
       }
 
-      // 获取主机名
-      const hostname = await agent.getHostName()
-      if (hostname) {
-        this.status.hostname = hostname
+      const now = Date.now()
+
+      // hostname/vCPU 很少变化，60s 刷新一次
+      if (now - this.staticInfoAt >= 60000) {
+        const hostname = await agent.getHostName()
+        if (hostname) {
+          this.status.hostname = hostname
+        }
+        const vcpus: ESObject[] | null = await agent.getVcpus()
+        if (vcpus) {
+          this.status.cpuCount = vcpus.length
+        }
+        this.staticInfoAt = now
       }
 
-      // 获取 vCPU 数量
-      const vcpus: ESObject[] | null = await agent.getVcpus()
-      if (vcpus) {
-        this.status.cpuCount = vcpus.length
-      }
-
-      // 获取文件系统信息
-      const fsInfo: ESObject[] | null = await agent.getFilesystemInfo()
-      if (fsInfo && fsInfo.length > 0) {
-        // 找根文件系统
-        for (let i = 0; i < fsInfo.length; i++) {
-          const fsi = fsInfo[i] as Record<string, ESObject>
-          if (fsi['mountpoint'] === '/') {
-            const total = fsi['total-bytes'] as number
-            const used = fsi['used-bytes'] as number
-            this.status.diskTotal = total || 0
-            this.status.diskUsed = used || 0
-            if (this.status.diskTotal > 0) {
-              this.status.diskUsage = Math.round((this.status.diskUsed / this.status.diskTotal) * 100)
+      // 磁盘 used-bytes 是动态值，最多缓存 30s
+      if (now - this.fsInfoAt >= 30000) {
+        const fsInfo: ESObject[] | null = await agent.getFilesystemInfo()
+        if (fsInfo && fsInfo.length > 0) {
+          for (let i = 0; i < fsInfo.length; i++) {
+            const fsi = fsInfo[i] as Record<string, ESObject>
+            if (fsi['mountpoint'] === '/') {
+              const total = fsi['total-bytes'] as number
+              const used = fsi['used-bytes'] as number
+              this.status.diskTotal = total || 0
+              this.status.diskUsed = used || 0
+              if (this.status.diskTotal > 0) {
+                this.status.diskUsage = Math.round((this.status.diskUsed / this.status.diskTotal) * 100)
+              }
+              break
             }
-            break
           }
         }
+        this.fsInfoAt = now
       }
 
-      // 获取内存信息 (始终获取，以满足核心数据要求)
-      const memInfo: Record<string, number> | null = await agent.getMemoryInfo()
+      const memInfo = metrics.memoryInfo
       if (memInfo) {
         this.status.memoryTotal = memInfo['MemTotal'] || 0
         const memAvailable = memInfo['MemAvailable'] || 0
@@ -451,10 +477,8 @@ export struct VmStatusBar {
         }
       }
 
-      // 如果启用监控，获取动态数据
       if (this.settings.masterSwitch) {
-        // 获取 CPU 统计信息并计算使用率
-        const cpuStats: CpuStats | null = await agent.getCpuStats()
+        const cpuStats = metrics.cpuStats
         if (cpuStats) {
           if (this.lastCpuStats) {
             const diffTotal = cpuStats.total - this.lastCpuStats.total
@@ -467,8 +491,7 @@ export struct VmStatusBar {
           this.lastCpuStats = newCpuStats
         }
 
-        // 检查 SSH
-        this.status.sshRunning = await agent.isSshRunning()
+        this.status.sshRunning = metrics.sshRunning
       }
 
       // 只有在非外部传入 agent 时才释放

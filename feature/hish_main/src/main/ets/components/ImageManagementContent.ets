@@ -7,6 +7,7 @@ import napi from 'libhish_main.so'
 import { taskpool } from '@kit.ArkTS';
 import { getSnapshotsTask, createSnapshotTask, applySnapshotTask, deleteSnapshotTask, optimizeImageTask, getImageInfoTask, needRestartTask } from '../utils/ImageTasks';
 import appOption from '../model/appOption'
+import { readQcow2VirtualSizeAsync } from '../lib/readQcow2VirtualSize'
 
 const DOMAIN = 0x0000
 
@@ -206,7 +207,7 @@ export default struct ImageManagementContent {
       const diskSize = stat.size
       
       // 异步读取 QCOW2 虚拟大小
-      const virtualSize = await this.readQcow2VirtualSizeAsync(fullPath)
+      const virtualSize = await readQcow2VirtualSizeAsync(fullPath)
       
       this.basicInfo = {
         name: fileName,
@@ -228,28 +229,6 @@ export default struct ImageManagementContent {
     this.loadBasicInfoAsync()
   }
 
-  /**
-   * 异步读取 QCOW2 文件的虚拟大小
-   */
-  private async readQcow2VirtualSizeAsync(filePath: string): Promise<number> {
-    try {
-      const f = await fs.open(filePath, fs.OpenMode.READ_ONLY)
-      const HEADER_SIZE = 32
-      const buffer = new ArrayBuffer(HEADER_SIZE)
-      const readResult = await fs.read(f.fd, buffer, { offset: 0, length: HEADER_SIZE })
-      await fs.close(f)
-      
-      if (readResult < HEADER_SIZE) {
-        return 0
-      }
-      
-      const dataView = new DataView(buffer)
-      const size = dataView.getBigInt64(24, false)
-      return Number(size)
-    } catch (e) {
-      return 0
-    }
-  }
 
   /**
    * 加载详细镜像信息（使用 taskpool 异步调用 NAPI）

@@ -63,6 +63,8 @@ class appOption {
   static qemuImgTaskDescription = 'qemuImgTaskDescription';
   // QGA 连接状态 (Global Truth)
   static isQgaConnected = 'isQgaConnected';
+  // 应用前后台状态（用于暂停后台轮询）
+  static appInBackground = 'appInBackground';
 }
 
 async function savePreference(key: string, value: object | string | boolean | number, context: UIContext) {

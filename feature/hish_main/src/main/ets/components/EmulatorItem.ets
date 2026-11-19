@@ -1,5 +1,5 @@
 import { Emulator } from '../model/Emulator';
-import readQcow2VirtualSize from '../lib/readQcow2VirtualSize';
+import { readQcow2VirtualSizeAsync } from '../lib/readQcow2VirtualSize';
 import appOption from '../model/appOption';
 import { util } from '@kit.ArkTS';
 import { ImmersiveButtonModifier } from '../lib/immersiveButton';
@@ -22,8 +22,11 @@ export default struct EmulatorItem {
   immersiveButton: ImmersiveButtonModifier = new ImmersiveButtonModifier()
 
   aboutToAppear(): void {
-    const rootfsPath = this.emulator.rootFilesystem
-    const virtualSize = readQcow2VirtualSize(rootfsPath)
+    this.loadStorageSize()
+  }
+
+  private async loadStorageSize(): Promise<void> {
+    const virtualSize = await readQcow2VirtualSizeAsync(this.emulator.rootFilesystem)
     this.storageSize = virtualSize / (1024 * 1024 * 1024)
   }
 

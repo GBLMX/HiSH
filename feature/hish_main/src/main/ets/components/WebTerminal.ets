@@ -395,19 +395,19 @@ export default struct WebTerminal {
   //  ============== for javascript in ArkWeb ================
 
   sendInput(data: string): void {
-    hilog.info(DOMAIN, 'WebTerminal', 'sendInput, data: %{public}s', data);
+    hilog.debug(DOMAIN, 'WebTerminal', 'sendInput, data: %{public}s', data);
 
     const modifierResult = applyVirtualKeyModifiers(data, this.ctrlPressed, this.shiftPressed)
     data = modifierResult.data
 
     if (modifierResult.ctrlConverted) {
-      hilog.info(DOMAIN, 'WebTerminal', 'sendInput with Ctrl, converted to control char');
+      hilog.debug(DOMAIN, 'WebTerminal', 'sendInput with Ctrl, converted to control char');
     }
     if (modifierResult.shouldResetCtrl) {
       this.toggleCtrl()
     }
     if (modifierResult.shiftConverted) {
-      hilog.info(DOMAIN, 'WebTerminal', 'sendInput with Shift, converted to: %{public}s', data);
+      hilog.debug(DOMAIN, 'WebTerminal', 'sendInput with Shift, converted to: %{public}s', data);
     }
 
     let buffer = stringToArrayBuffer(data, 'utf-8');

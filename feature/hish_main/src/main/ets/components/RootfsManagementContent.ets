@@ -5,12 +5,12 @@ import { defaultRootfs, RootFilesystem } from "../model/Emulator"
 import { RepeatGrid } from "../components/RepeatGrid"
 import { common } from "@kit.AbilityKit";
 import { CustomContentDialog, LoadingDialog } from "@kit.ArkUI";
-import { util } from "@kit.ArkTS";
+import { util, taskpool } from "@kit.ArkTS";
 import copyFile from "../lib/copyFile";
 import { fileIo as fs } from '@kit.CoreFileKit'
-import readQcow2VirtualSize from '../lib/readQcow2VirtualSize';
+import { readQcow2VirtualSizeAsync } from '../lib/readQcow2VirtualSize';
+import { getImageInfoTask } from '../utils/ImageTasks';
 import { BackButton } from './BackButton';
-import napi from 'libhish_main.so';
 
 interface RootfsItem {
   model: RootFilesystem
@@ -348,9 +348,9 @@ export default struct RootfsManagementContent {
   /**
    * 显示磁盘信息
    */
-  private showDiskInfo(item: RootFilesystem): void {
+  private async showDiskInfo(item: RootFilesystem): Promise<void> {
     try {
-      const result: string = napi.getImageInfo(item.path)
+      const result: string = await taskpool.execute(getImageInfoTask, item.path) as string
       const info: Record<string, ESObject> = JSON.parse(result) as Record<string, ESObject>
 
       if (info['error']) {
@@ -469,25 +469,24 @@ export default struct RootfsManagementContent {
     this.rootfsNameController.open()
   }
 
-  syncRootfsViewItems() {
-    this.rootfsItems.splice(0, this.rootfsItems.length)
-
-    setTimeout(() => {
-      for (let i = 0; i < this.roots.length; i++) {
-        const it = this.roots[i]
-        const path = it.path
-        const stat = fs.statSync(path)
+  async syncRootfsViewItems(): Promise<void> {
+    const items: RootfsItem[] = []
+    for (let i = 0; i < this.roots.length; i++) {
+      const it = this.roots[i]
+      const path = it.path
+      try {
+        const stat = await fs.stat(path)
         const sizeString = (stat.size / (1024 * 1024)).toFixed(1) + ' MB'
-        const virtualSize = readQcow2VirtualSize(path)
-        let virtualSizeString: string;
-        if (virtualSize === undefined) {
-          virtualSizeString = '-'
-        } else {
-          virtualSizeString = (virtualSize / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
-        }
-        this.rootfsItems.push({ model: it, fileSize: sizeString, virtualSize: virtualSizeString })
+        const virtualSize = await readQcow2VirtualSizeAsync(path)
+        const virtualSizeString = virtualSize > 0
+          ? (virtualSize / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
+          : '-'
+        items.push({ model: it, fileSize: sizeString, virtualSize: virtualSizeString })
+      } catch (e) {
+        items.push({ model: it, fileSize: '-', virtualSize: '-' })
       }
-    }, 20)
+    }
+    this.rootfsItems = items
   }
 }
 

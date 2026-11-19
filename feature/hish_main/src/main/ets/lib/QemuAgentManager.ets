@@ -61,7 +61,7 @@ class QemuAgentManagerImpl {
    * @param timeout 超时时间（毫秒），默认 5000
    */
   async acquire(userId: string, priority: AgentPriority = AgentPriority.NORMAL, timeout: number = 5000): Promise<QemuAgent | null> {
-    hilog.info(DOMAIN, 'AgentManager', '请求连接: %{public}s, 优先级: %{public}d', userId, priority)
+    hilog.debug(DOMAIN, 'AgentManager', '请求连接: %{public}s, 优先级: %{public}d', userId, priority)
 
     // 如果当前没有使用者，直接获取
     if (!this.currentUser) {
@@ -72,7 +72,7 @@ class QemuAgentManagerImpl {
     if (this.currentUser === userId && this.agent) {
       // [修复] 即使是同一用户，也要检查 Agent 是否真的存活（防止 Socket 已断开但逻辑状态未更新）
       if (this.agent.isAlive()) {
-        hilog.info(DOMAIN, 'AgentManager', '用户 %{public}s 复用现有活跃 Agent', userId);
+        hilog.debug(DOMAIN, 'AgentManager', '用户 %{public}s 复用现有活跃 Agent', userId);
         return this.agent;
       }
       hilog.warn(DOMAIN, 'AgentManager', '用户 %{public}s 的 Agent 已失效，准备释放并重新创建', userId);
@@ -154,7 +154,7 @@ class QemuAgentManagerImpl {
       return
     }
 
-    hilog.info(DOMAIN, 'AgentManager', '%{public}s 释放连接 (进入空闲复用状态)', userId)
+    hilog.debug(DOMAIN, 'AgentManager', '%{public}s 释放连接 (进入空闲复用状态)', userId)
 
     // 软释放：不关闭连接，只清除使用者标识
     // 这样下次 acquire 可以直接复用
@@ -191,7 +191,7 @@ class QemuAgentManagerImpl {
   private async createConnection(userId: string): Promise<QemuAgent | null> {
     // 如果已有连接且可用，直接复用
     if (this.agent && this.agent.isAlive()) {
-      hilog.info(DOMAIN, 'AgentManager', '复用现有空闲连接: %{public}s', userId)
+      hilog.debug(DOMAIN, 'AgentManager', '复用现有空闲连接: %{public}s', userId)
       this.currentUser = userId
       return this.agent
     }

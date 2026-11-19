@@ -4,6 +4,9 @@ import { hilog } from '@kit.PerformanceAnalysisKit'
 
 const DOMAIN = 0x0000
 
+// 同一文件（路径+mtime+size）的 data URL 只编码一次
+const dataUrlCache: Map<string, string> = new Map()
+
 /**
  * 根据文件扩展名推断 MIME 类型（用于 data URL）
  */
@@ -47,6 +50,11 @@ function fileToDataUrl(path: string): string {
   let file: fs.File | undefined = undefined
   try {
     const stat = fs.statSync(path)
+    const cacheKey = `${path}:${stat.mtime}:${stat.size}`
+    const cached = dataUrlCache.get(cacheKey)
+    if (cached !== undefined) {
+      return cached
+    }
     file = fs.openSync(path, fs.OpenMode.READ_ONLY)
     const buf = new ArrayBuffer(stat.size)
     let offset = 0
@@ -58,7 +66,12 @@ function fileToDataUrl(path: string): string {
       offset += readLen
     }
     const base64 = new util.Base64Helper().encodeToStringSync(new Uint8Array(buf, 0, offset))
-    return `data:${mimeOf(path)};base64,${base64}`
+    const url = `data:${mimeOf(path)};base64,${base64}`
+    if (dataUrlCache.size >= 8) {
+      dataUrlCache.clear()
+    }
+    dataUrlCache.set(cacheKey, url)
+    return url
   } catch (e) {
     hilog.error(DOMAIN, 'fileToDataUrl', 'read file failed: %{public}s, %{public}s', path, JSON.stringify(e))
     return ''

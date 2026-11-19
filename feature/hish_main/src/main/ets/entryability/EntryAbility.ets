@@ -27,18 +27,12 @@ interface StartResult {
  * @returns 可用端口号，如果找不到则返回 undefined
  */
 function getFreeVncPort(min: number, max: number): number | undefined {
-  const range = max - min + 1;
-  const maxAttempts = 100; // 最大尝试次数
-
-  for (let i = 0; i < maxAttempts; i++) {
-    const port = min + Math.floor(Math.random() * range);
-    if (!napi.checkPortUsed(port)) {
-      return port;
-    }
+  const port = napi.findFreePort(min, max);
+  if (port < 0) {
+    hilog.warn(DOMAIN, 'testTag', 'Could not find a free VNC port in [%{public}d, %{public}d]', min, max);
+    return undefined;
   }
-
-  hilog.warn(DOMAIN, 'testTag', 'Could not find a free VNC port after %{public}d attempts', maxAttempts);
-  return undefined;
+  return port;
 }
 
 export default class EntryAbility extends UIAbility {
@@ -349,6 +343,7 @@ export default class EntryAbility extends UIAbility {
 
   async onForeground() {
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
+    AppStorage.setOrCreate(appOption.appInBackground, false)
 
     const runningInBackground = AppStorage.get(appOption.runningInBackground) as boolean || false
     if (runningInBackground) {
@@ -359,6 +354,7 @@ export default class EntryAbility extends UIAbility {
   async onBackground() {
     // Ability has back to background
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
+    AppStorage.setOrCreate(appOption.appInBackground, true)
     const runningInBackground = AppStorage.get(appOption.runningInBackground) as boolean || false
     if (runningInBackground) {
       const success = await backgroundRunningManager.startBackground(this.context)

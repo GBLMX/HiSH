@@ -1,11 +1,12 @@
 import { fileIo as fs } from '@kit.CoreFileKit'
 import { Emulator, RootFilesystem } from '../model/Emulator';
 import { RepeatGrid } from './RepeatGrid';
-import { util } from '@kit.ArkTS';
+import { util, taskpool } from '@kit.ArkTS';
 import appOption, { savePreference } from '../model/appOption';
 import { CustomContentDialog, LoadingDialog } from '@kit.ArkUI';
 import copyFile from '../lib/copyFile';
 import napi from 'libhish_main.so';
+import { getSnapshotsTask } from '../utils/ImageTasks';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { Want, bundleManager } from '@kit.AbilityKit';
 import EmulatorItem from './EmulatorItem';
@@ -199,7 +200,7 @@ export default struct EmulatorListGrid {
       onExport: async (item: Emulator): Promise<void> => {
         // 检查是否有快照
         try {
-          const result: string = napi.getSnapshots(item.rootFilesystem)
+          const result: string = await taskpool.execute(getSnapshotsTask, item.rootFilesystem) as string
           const response: Record<string, ESObject> = JSON.parse(result) as Record<string, ESObject>
           const snapshots: Array<ESObject> = response['snapshots'] as Array<ESObject>
 

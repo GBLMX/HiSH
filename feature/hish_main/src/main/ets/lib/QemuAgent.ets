@@ -528,7 +528,6 @@ export class QemuAgent {
     return result !== null
   }
 
-
   private parseMemoryInfo(output: string): Record<string, number> {
     const result: Record<string, number> = {}
     const lines = output.split('\n')

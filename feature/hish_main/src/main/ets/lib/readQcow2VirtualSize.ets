@@ -1,6 +1,5 @@
 import { fileIo as fs } from '@kit.CoreFileKit'
 
-
 export async function readQcow2VirtualSizeAsync(filePath: string): Promise<number> {
   try {
     const f = await fs.open(filePath, fs.OpenMode.READ_ONLY)

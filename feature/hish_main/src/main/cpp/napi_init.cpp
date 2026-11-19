@@ -1404,7 +1404,6 @@ static napi_value checkPortUsed(napi_env env, napi_callback_info info) {
     }
 }
 
-
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {

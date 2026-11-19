@@ -263,8 +263,12 @@ export default class EntryAbility extends UIAbility {
     const bundleInfo = AppStorage.get('bundleInfo') as bundleManager.BundleInfo
     const forceOverride = lastResourceVersion === undefined
       || lastResourceVersion !== bundleInfo.versionCode
-      || bundleInfo.name.startsWith('dev.hackeris')
-    this.extractVmResourceFile(appContext, 'vm/rootfs_aarch64.qcow2', 'roots/rootfs_aarch64.qcow2', forceOverride);
+    const rootfsPath = rootfsBaseDir + '/rootfs_aarch64.qcow2'
+    let overrideRootfs = forceOverride
+    if (overrideRootfs && fs.accessSync(rootfsPath, fs.AccessModeType.EXIST)) {
+      overrideRootfs = this.backupRootfs(rootfsBaseDir)
+    }
+    this.extractVmResourceFile(appContext, 'vm/rootfs_aarch64.qcow2', 'roots/rootfs_aarch64.qcow2', overrideRootfs);
     this.extractVmResourceFile(appContext, 'vm/kernel_aarch64', 'vm/kernel_aarch64', forceOverride);
     this.extractVmResourceFile(appContext, 'vm/efi-virtio.rom', 'vm/efi-virtio.rom', forceOverride);
 
@@ -309,7 +313,7 @@ export default class EntryAbility extends UIAbility {
     if (!fs.accessSync(filePath, fs.AccessModeType.EXIST) || forceOverride) {
       try {
         let value: Uint8Array = appContext.resourceManager.getRawFileContentSync(filename);
-        let file = fs.openSync(filePath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
+        let file = fs.openSync(filePath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
         fs.writeSync(file.fd, value.buffer);
         fs.closeSync(file);
         hilog.info(DOMAIN, 'testTag', 'Extract resource file: %{public}s', filePath);
@@ -318,6 +322,26 @@ export default class EntryAbility extends UIAbility {
           'Skip extracting missing resource %{public}s to %{public}s: %{public}s',
           filename, filePath, JSON.stringify(e))
       }
+    }
+  }
+
+  private backupRootfs(rootfsBaseDir: string): boolean {
+    const source = rootfsBaseDir + '/rootfs_aarch64.qcow2'
+    const backupDir = rootfsBaseDir + '/backup'
+    const target = backupDir + '/rootfs_aarch64.qcow2.bak'
+    try {
+      if (!fs.accessSync(backupDir, fs.AccessModeType.EXIST)) {
+        fs.mkdirSync(backupDir)
+      }
+      if (fs.accessSync(target, fs.AccessModeType.EXIST)) {
+        fs.unlinkSync(target)
+      }
+      fs.copyFileSync(source, target)
+      hilog.info(DOMAIN, 'testTag', 'Rootfs backup created: %{public}s', target)
+      return true
+    } catch (e) {
+      hilog.error(DOMAIN, 'testTag', 'Rootfs backup failed, keep existing: %{public}s', JSON.stringify(e))
+      return false
     }
   }
 

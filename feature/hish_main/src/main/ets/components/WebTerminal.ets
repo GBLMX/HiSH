@@ -18,6 +18,8 @@ import {
 } from '../lib/terminalVirtualKeys';
 
 const DOMAIN = 0x0000;
+const PORT_READY_MESSAGE = 'ready';
+const PORT_UNSUPPORTED_MESSAGE = 'unsupported';
 
 const VKeyMetrics = getVirtualKeyMetrics(deviceInfo.deviceType)
 const VKeyMargin = VKeyMetrics.margin;
@@ -49,6 +51,10 @@ export default struct WebTerminal {
   utf8Decoder = util.TextDecoder.create('utf-8', { ignoreBOM: true })
   resizeTimeout?: number = undefined
   applicationMode: boolean = false
+  private outputPort?: webview.WebMessagePort = undefined
+  private outputPortReady: boolean = false
+  private portReadyPending: boolean = false
+  private lastJsWrite?: Promise<string> = undefined
   immersiveButton: ImmersiveButtonModifier = new ImmersiveButtonModifier()
   immersiveToggle: ImmersiveToggleModifier = new ImmersiveToggleModifier()
 
@@ -253,6 +259,12 @@ export default struct WebTerminal {
         }`
         })
         .backgroundColor('#000')
+        .onPageBegin(() => {
+          // 页面重载后旧端口失效，等新页面再次调用 native.load() 重新握手
+          this.outputPortReady = false;
+          this.portReadyPending = false;
+          this.lastJsWrite = undefined;
+        })
         .layoutWeight(1)
         .bindContextMenu(this.contextMenu(this.webviewController), ResponseType.RightClick)
       if (this.virtKeyEnabled) {
@@ -397,6 +409,7 @@ export default struct WebTerminal {
   }
 
   async load(): Promise<void> {
+    this.setupOutputPort();
     this.webviewController.runJavaScript('exports.setFocused(true)')
     napi.onData((d: ArrayBuffer): void => this.onData(d))
     napi.onShutdown((): void => {
@@ -407,8 +420,84 @@ export default struct WebTerminal {
       const message = this.getUIContext().getHostContext()?.resourceManager.getStringByNameSync('pm_status_qmp_connect_failed')
         ?? 'Failed to connect to QMP (please restart app)'
       const text = util.TextEncoder.create('utf-8').encodeInto('\r\n' + message + '\r\n')
-      const base64 = new util.Base64Helper().encodeToStringSync(text)
-      this.webviewController.runJavaScript(`exports.writeBase64("${base64}", ${this.applicationMode})`)
+      this.sendToWebView(text)
+    }
+  }
+
+  private setupOutputPort(): void {
+    // 二进制端口是加速通道；任何一步失败都保留 runJavaScript/base64 回退
+    this.outputPortReady = false;
+    this.portReadyPending = false;
+    if (this.outputPort !== undefined) {
+      try {
+        this.outputPort.close();
+      } catch (e) {
+        hilog.warn(DOMAIN, 'WebTerminal', 'close output port failed: %{public}s', JSON.stringify(e));
+      }
+      this.outputPort = undefined;
+    }
+
+    try {
+      const ports = this.webviewController.createWebMessagePorts();
+      if (ports.length < 2) {
+        hilog.error(DOMAIN, 'WebTerminal', 'createWebMessagePorts returned %{public}d ports', ports.length);
+        return;
+      }
+      ports[0].onMessageEvent((message: webview.WebMessage): void => {
+        if (typeof message !== 'string') {
+          return;
+        }
+        if (message === PORT_READY_MESSAGE) {
+          hilog.info(DOMAIN, 'WebTerminal', 'binary output port ready');
+          this.portReadyPending = true;
+          this.maybeEnableOutputPort();
+        } else if (message === PORT_UNSUPPORTED_MESSAGE) {
+          // 端口无法传二进制时永久回退到 runJavaScript
+          hilog.warn(DOMAIN, 'WebTerminal', 'binary output port unsupported, fallback to runJavaScript');
+          this.portReadyPending = false;
+          this.outputPortReady = false;
+        }
+      });
+      this.webviewController.postMessage('hish_term_port', [ports[1]], '*');
+      this.outputPort = ports[0];
+    } catch (e) {
+      hilog.error(DOMAIN, 'WebTerminal', 'message port setup failed: %{public}s', JSON.stringify(e));
+      this.outputPort = undefined;
+    }
+  }
+
+  private sendToWebView(data: Uint8Array): void {
+    if (this.outputPortReady && this.outputPort !== undefined) {
+      try {
+        this.outputPort.postMessageEvent(data.buffer as ArrayBuffer);
+        return;
+      } catch (e) {
+        hilog.error(DOMAIN, 'WebTerminal', 'postMessageEvent failed, fallback to runJavaScript: %{public}s',
+          JSON.stringify(e));
+        this.outputPortReady = false;
+      }
+    }
+    const base64 = new util.Base64Helper().encodeToStringSync(data);
+    const jsWrite = this.webviewController.runJavaScript(`exports.writeBase64("${base64}")`);
+    this.lastJsWrite = jsWrite;
+    jsWrite.then((): void => {
+      if (this.lastJsWrite === jsWrite) {
+        this.lastJsWrite = undefined;
+      }
+      this.maybeEnableOutputPort();
+    }).catch((e: Error): void => {
+      if (this.lastJsWrite === jsWrite) {
+        this.lastJsWrite = undefined;
+      }
+      this.maybeEnableOutputPort();
+      hilog.error(DOMAIN, 'WebTerminal', 'writeBase64 failed: %{public}s', JSON.stringify(e));
+    });
+  }
+
+  private maybeEnableOutputPort(): void {
+    if (this.portReadyPending && this.lastJsWrite === undefined) {
+      this.portReadyPending = false;
+      this.outputPortReady = true;
     }
   }
 
@@ -465,25 +554,16 @@ export default struct WebTerminal {
       // 清空缓冲区
       this.pendingChunks = [];
 
-      // 3. 检测清屏信号
-      // 检查合并后的数据是否包含 \x1b[H\x1b[J 的字面量转义序列
-      if (merged.length >= 12 &&
-        merged[0] === 0x5C && merged[1] === 0x78 && merged[2] === 0x31 && merged[3] === 0x62 && // \x1b
-        merged[4] === 0x5B && merged[5] === 0x48 && // [H
-        merged[6] === 0x5C && merged[7] === 0x78 && merged[8] === 0x31 && merged[9] === 0x62 && // \x1b
-        merged[10] === 0x5B && merged[11] === 0x4A // [J
-      ) {
-        const clearCmd = '\\x1b[3J';
-        const encoder = util.TextEncoder.create('utf-8');
-        const clearBytes = encoder.encodeInto(clearCmd);
-        const clearBase64 = new util.Base64Helper().encodeToStringSync(clearBytes);
-        this.webviewController.runJavaScript(`exports.writeBase64("${clearBase64}", ${this.applicationMode})`);
+      // 3. 检测清屏信号：真实字节 ESC [ H ESC [ J
+      if (merged.length >= 6 &&
+        merged[0] === 0x1b && merged[1] === 0x5b && merged[2] === 0x48 &&
+        merged[3] === 0x1b && merged[4] === 0x5b && merged[5] === 0x4a) {
+        // ESC [ 3 J：连同回滚缓冲区一起清掉
+        this.sendToWebView(new Uint8Array([0x1b, 0x5b, 0x33, 0x4a]));
       }
 
       // 4. 发送合并后的数据
-      const base64Helper = new util.Base64Helper();
-      const base64 = base64Helper.encodeToStringSync(merged);
-      this.webviewController.runJavaScript(`exports.writeBase64("${base64}", ${this.applicationMode})`);
+      this.sendToWebView(merged);
 
     } catch (e) {
       hilog.error(DOMAIN, 'WebTerminal', 'flushData failed: %{public}s', JSON.stringify(e));

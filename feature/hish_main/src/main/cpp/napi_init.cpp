@@ -808,14 +808,32 @@ static napi_value optimizeImage(napi_env env, napi_callback_info info)
 // ================== VNC functions are in napi_vnc.cpp ==================
 
 
+static void free_data_buffer(napi_env env, void *finalize_data, void *finalize_hint) {
+    delete[] static_cast<char *>(finalize_data);
+    delete static_cast<data_buffer *>(finalize_hint);
+}
+
 static void call_on_data_callback(napi_env env, napi_value js_callback, void *context, void *data) {
 
     data_buffer *buffer = static_cast<data_buffer *>(data);
 
+    // 零拷贝：裸字节直接交给 JS，finalizer 负责回收
     napi_value ab;
-    char *input;
-    napi_create_arraybuffer(env, buffer->size, (void **)&input, &ab);
-    memcpy(input, buffer->buf, buffer->size);
+    napi_status status = napi_create_external_arraybuffer(
+        env, buffer->buf, buffer->size, free_data_buffer, buffer, &ab);
+    if (status != napi_ok) {
+        // 外部 ArrayBuffer 不可用时回退到拷贝路径，避免终端整体无输出
+        void *copy = nullptr;
+        status = napi_create_arraybuffer(env, buffer->size, &copy, &ab);
+        if (status == napi_ok) {
+            memcpy(copy, buffer->buf, buffer->size);
+        }
+        free_data_buffer(env, buffer->buf, buffer);
+        if (status != napi_ok) {
+            OH_LOG_ERROR(LOG_APP, "create arraybuffer failed: %{public}d", status);
+            return;
+        }
+    }
 
     napi_value global;
     napi_get_global(env, &global);
@@ -823,9 +841,6 @@ static void call_on_data_callback(napi_env env, napi_value js_callback, void *co
     napi_value result;
     napi_value args[1] = {ab};
     napi_call_function(env, global, js_callback, 1, args, &result);
-
-    delete[] buffer->buf;
-    delete buffer;
 }
 
 static void call_on_shutdown_callback(napi_env env, napi_value js_callback, void *context, void *data) {
@@ -836,38 +851,24 @@ static void call_on_shutdown_callback(napi_env env, napi_value js_callback, void
     napi_call_function(env, global, js_callback, 0, nullptr, nullptr);
 }
 
-std::string convert_to_hex(const uint8_t *buffer, int r) {
-    std::string hex;
-    for (int i = 0; i < r; i++) {
-        if (buffer[i] >= 127 || buffer[i] < 32) {
-            char temp[8];
-            snprintf(temp, sizeof(temp), "\\x%02x", buffer[i]);
-            hex += temp;
-        } else if (buffer[i] == '\'' || buffer[i] == '\"' || buffer[i] == '\\') {
-            char temp[8];
-            snprintf(temp, sizeof(temp), "\\%c", buffer[i]);
-            hex += temp;
-        } else {
-            hex += (char)buffer[i];
-        }
+void send_data_to_callback(const uint8_t *data, size_t size, napi_threadsafe_function callback) {
+    data_buffer *pbuf = new data_buffer{.buf = new char[size], .size = size};
+    memcpy(pbuf->buf, data, size);
+    if (napi_call_threadsafe_function(callback, pbuf, napi_tsfn_nonblocking) != napi_ok) {
+        delete[] pbuf->buf;
+        delete pbuf;
     }
-    return hex;
 }
 
-void send_data_to_callback(const std::string &hex, napi_threadsafe_function callback) {
-    data_buffer *pbuf = new data_buffer{.buf = new char[hex.length()], .size = (size_t)hex.length()};
-    memcpy(pbuf->buf, &hex[0], hex.length());
-    napi_call_threadsafe_function(callback, pbuf, napi_tsfn_nonblocking);
-}
-
-void on_serial_data_received(const std::string &hex) {
-    if (hex.length() > 0) {
-        std::lock_guard<std::mutex> lk(buffer_mtx);
-        if (on_data_callback != nullptr) {
-            send_data_to_callback(hex, on_data_callback);
-        } else {
-            temp_buffer.append(hex);
-        }
+void on_serial_data_received(const uint8_t *data, size_t size) {
+    if (size == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(buffer_mtx);
+    if (on_data_callback != nullptr) {
+        send_data_to_callback(data, size, on_data_callback);
+    } else {
+        temp_buffer.append(reinterpret_cast<const char *>(data), size);
     }
 }
 
@@ -915,33 +916,56 @@ void serial_output_worker(const char *unix_socket_path) {
 
     OH_LOG_INFO(LOG_APP, "Connected to unix socket: %{public}d", serial_input_fd);
 
+    // 只对读取用 MSG_DONTWAIT：socket 保持阻塞，sendInput 的 write 语义不变
+    constexpr size_t kSerialReadChunk = 16 * 1024;
+    constexpr size_t kSerialBatchLimit = 256 * 1024;
+    uint8_t read_buffer[kSerialReadChunk];
+
     while (true) {
 
         bool broken = false;
 
-        struct pollfd fds[2];
-        fds[0].fd = client_fd;
-        fds[0].events = POLLIN;
-        int res = poll(fds, 1, 100);
+        struct pollfd pfd;
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int res = poll(&pfd, 1, 100);
 
-        uint8_t buffer[1024];
-        for (int i = 0; i < res; i += 1) {
-            int fd = fds[i].fd;
-            ssize_t r = read(fd, buffer, sizeof(buffer) - 1);
-            if (r > 0) {
-                // pretty print
-                auto hex = convert_to_hex(buffer, r);
-                //  call callback registered by ArkTS
-                on_serial_data_received(hex);
-                OH_LOG_INFO(LOG_APP, "Received, data: %{public}s", hex.c_str());
-            } else if (r < 0) {
-                OH_LOG_INFO(LOG_APP, "Program exited, %{public}ld %{public}d", r, errno);
+        if (res < 0 && errno != EINTR) {
+            OH_LOG_ERROR(LOG_APP, "Serial poll failed: %{public}d", errno);
+            broken = true;
+        } else if (res > 0) {
+            // 把当前可读数据一次抽干，整批只走一次 TSFN
+            std::vector<uint8_t> batch;
+            batch.reserve(kSerialReadChunk);
+            for (;;) {
+                ssize_t r = recv(client_fd, read_buffer, sizeof(read_buffer), MSG_DONTWAIT);
+                if (r > 0) {
+                    batch.insert(batch.end(), read_buffer, read_buffer + r);
+                    if (batch.size() >= kSerialBatchLimit) {
+                        on_serial_data_received(batch.data(), batch.size());
+                        batch.clear();
+                    }
+                    continue;
+                }
+                if (r == 0) {
+                    // EOF: 对端关闭了连接
+                    OH_LOG_INFO(LOG_APP, "Serial socket EOF - peer closed connection");
+                    broken = true;
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                OH_LOG_ERROR(LOG_APP, "Serial read failed: %{public}d", errno);
                 broken = true;
+                break;
             }
-            else if (r == 0) {
-                // EOF: 对端关闭了连接
-                OH_LOG_INFO(LOG_APP, "Serial socket EOF - peer closed connection");
-                broken = true;
+            if (!batch.empty()) {
+                on_serial_data_received(batch.data(), batch.size());
             }
         }
 
@@ -949,15 +973,18 @@ void serial_output_worker(const char *unix_socket_path) {
             break;
         }
     }
-    
+
     // 清理 socket 资源，但保留回调以便新的 worker 线程使用
     close(client_fd);
     serial_input_fd = -1;
     OH_LOG_INFO(LOG_APP, "Closed serial socket fd: %{public}d", client_fd);
-    
-    if (on_data_callback != nullptr) {
-        napi_release_threadsafe_function(on_data_callback, napi_threadsafe_function_release_mode::napi_tsfn_release);
-        on_data_callback = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lk(buffer_mtx);
+        if (on_data_callback != nullptr) {
+            napi_release_threadsafe_function(on_data_callback, napi_threadsafe_function_release_mode::napi_tsfn_release);
+            on_data_callback = nullptr;
+        }
     }
 
     OH_LOG_INFO(LOG_APP, "Serial unix socket broken: %{public}d", errno);
@@ -1078,9 +1105,7 @@ static napi_value sendInput(napi_env env, napi_callback_info info) {
         return nullptr;
     }
 
-    // P0-06修复: 将ret改为length
-    std::string hex = convert_to_hex(data, length);
-    OH_LOG_INFO(LOG_APP, "Send, data: %{public}s", hex.c_str());
+    OH_LOG_DEBUG(LOG_APP, "Serial input: %{public}zu bytes", length);
 
     int written = 0;
     while (written < (int)length)
@@ -1113,7 +1138,8 @@ static napi_value onData(napi_env env, napi_callback_info info) {
     {
         std::lock_guard<std::mutex> lk(buffer_mtx);
         if (!temp_buffer.empty()) {
-            send_data_to_callback(temp_buffer, data_callback);
+            send_data_to_callback(reinterpret_cast<const uint8_t *>(temp_buffer.data()),
+                                  temp_buffer.size(), data_callback);
             temp_buffer.clear();
         }
         on_data_callback = data_callback;

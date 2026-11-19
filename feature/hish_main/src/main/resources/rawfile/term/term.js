@@ -3,6 +3,9 @@
 // because renderer options depend on native preferences (ligatures / italic).
 var term = null;
 
+// Last DECCKM state reported to ArkTS (virtual keys use it)
+var lastApplicationMode = null;
+
 // Tracks the currently selected font family so user fonts can re-apply it
 // once their FontFace finishes loading asynchronously.
 var currentFontFamily = 'Default';
@@ -13,6 +16,27 @@ const webglAddon = new WebglAddon.WebglAddon();
 
 // Initialize exports for ArkTS to call
 window.exports = {};
+
+// VM output can arrive over a binary MessagePort (see WebTerminal.setupOutputPort).
+// The port is optional: ArkTS falls back to exports.writeBase64 until it is ready.
+window.addEventListener('message', function (event) {
+    if (!event.ports || event.ports.length === 0) {
+        return;
+    }
+    var port = event.ports[0];
+    port.onmessage = function (messageEvent) {
+        if (messageEvent.data instanceof ArrayBuffer) {
+            writeToTerm(new Uint8Array(messageEvent.data));
+        } else {
+            // 端口不按契约传二进制时通知 ArkTS 退回 runJavaScript
+            port.postMessage('unsupported');
+        }
+    };
+    if (port.start) {
+        port.start();
+    }
+    port.postMessage('ready');
+});
 
 // Helper for decoding Latin1/Binary string from ArkTS to UTF-8
 const decoder = new TextDecoder('utf-8');
@@ -112,6 +136,55 @@ function strToUint8Array(str) {
         buf[i] = str.charCodeAt(i);
     }
     return buf;
+}
+
+// Decodes base64 directly into bytes: no intermediate binary string, no regex unescape.
+const HISH_BASE64_LOOKUP = (function () {
+    const table = new Uint8Array(256).fill(0xff);
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    for (let i = 0; i < chars.length; i++) {
+        table[chars.charCodeAt(i)] = i;
+    }
+    return table;
+})();
+
+function base64ToUint8Array(base64) {
+    let length = base64.length;
+    while (length > 0 && base64.charCodeAt(length - 1) === 0x3d) { // '='
+        length--;
+    }
+    const out = new Uint8Array((length * 3) >> 2);
+    let accumulator = 0;
+    let bits = 0;
+    let offset = 0;
+    for (let i = 0; i < length; i++) {
+        const value = HISH_BASE64_LOOKUP[base64.charCodeAt(i)];
+        if (value === 0xff) {
+            continue;
+        }
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[offset++] = (accumulator >> bits) & 0xff;
+        }
+    }
+    return offset === out.length ? out : out.subarray(0, offset);
+}
+
+// Single write path for VM output; keeps ArkTS virtual-key mode in sync.
+function writeToTerm(uint8) {
+    if (!term) {
+        return;
+    }
+    term.write(uint8);
+    const mode = term.modes.applicationCursorKeysMode;
+    if (mode !== lastApplicationMode) {
+        lastApplicationMode = mode;
+        if (native && native.setApplicationMode) {
+            native.setApplicationMode(mode);
+        }
+    }
 }
 
 // Creates the xterm.js Terminal instance.
@@ -584,54 +657,18 @@ function setupMirroredInputFix(termEl) {
 
 // --- Implementation of exports matching term.js.bak ---
 
-// exports.write(data) - Write data from VM to terminal
-exports.write = (data, applicationMode) => {
-    // legacy hterm code imply data is Binary String (UTF-8/Latin1 bytes)
+// exports.write(data) - legacy path; data is a "binary string" (one char per byte)
+exports.write = (data) => {
     try {
-        const uint8 = strToUint8Array(data);
-        term.write(uint8);
-        if (term.modes.applicationCursorKeysMode !== applicationMode) {
-            native.setApplicationMode(term.modes.applicationCursorKeysMode)
-        }
+        writeToTerm(strToUint8Array(data));
     } catch (e) {
         console.error("exports.write failed", e);
     }
 };
 
-exports.writeBase64 = (base64Data, applicationMode) => {
+exports.writeBase64 = (base64Data) => {
     try {
-        let binaryString = atob(base64Data);
-
-        // 兼容性修复：还原字面量转义序列 (Unescape)
-        // 支持 \xHH, \uHHHH, 以及常见 C 风格转义符 (\n, \r, \t, \', \", \\)
-        binaryString = binaryString.replace(/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)/g, (match, param) => {
-            if (param[0] === 'x' || param[0] === 'u') {
-                return String.fromCharCode(parseInt(param.slice(1), 16));
-            }
-            switch (param) {
-                case 'n': return '\n';
-                case 'r': return '\r';
-                case 't': return '\t';
-                case 'b': return '\b';
-                case 'f': return '\f';
-                case 'v': return '\v';
-                case '0': return '\0';
-                default: return param; // For \' \" \\ and others, just return the char
-            }
-        });
-
-        const uint8 = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-            uint8[i] = binaryString.charCodeAt(i);
-        }
-        term.write(uint8);
-
-        // Sync Application Cursor Mode using xterm.js state
-        if (term.modes.applicationCursorKeysMode !== applicationMode) {
-            if (native && native.setApplicationMode) {
-                native.setApplicationMode(term.modes.applicationCursorKeysMode);
-            }
-        }
+        writeToTerm(base64ToUint8Array(base64Data));
     } catch (e) {
         console.error("exports.writeBase64 failed", e);
     }

@@ -35,7 +35,14 @@ function startVm(options: VmOptions): boolean {
     "-object", "rng-random,filename=/dev/urandom,id=rng0",
     "-device", "virtio-rng-pci-non-transitional,rng=rng0",
     '-rtc', 'base=utc,clock=host', '-L', options.baseDir]
-  const serial = ['-serial', "unix:" + options.serialUnixSocket + ",server,nowait"]
+  // 终端使用 virtio-serial 普通端口；guest 由 hishterm-bridge 将 /dev/vport* 桥接到 PTY shell。
+  // ttyAMA0 保留为内核日志/回退，不承载交互。
+  const serial = [
+    '-chardev', `socket,id=term0,path=${options.serialUnixSocket},server=on,wait=off`,
+    '-device', 'virtio-serial-pci,id=virtio-serial-term0',
+    '-device', 'virtserialport,chardev=term0,bus=virtio-serial-term0.0,name=hishterm',
+    '-serial', 'null'
+  ]
   const cpuMem = ['-smp', `cpus=${options.cpu},sockets=1,cores=${options.cpu},threads=1`,
     "-object", `memory-backend-ram,id=mem0,size=${options.memory}M,merge=off,prealloc=off`, '-m', options.memory + 'M']
   const kernel = ['-kernel', options.kernel]
